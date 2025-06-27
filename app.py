@@ -1,5 +1,3 @@
-
-
 import os
 import re
 import shutil
@@ -7,11 +5,13 @@ import tempfile
 import traceback
 import logging
 import subprocess
+import io
 
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from langchain_groq import ChatGroq
@@ -21,60 +21,51 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-import whisper  
-
+import whisper
+from gtts import gTTS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scheduler")
 
-
-FFMPEG_BIN = r"C:\Users\Aditya\Downloads\ffmpeg-7.1.1-essentials_build\ffmpeg-7.1.1-essentials_build\bin"
+FFMPEG_BIN = r"C:\Users\Aditya\Downloads\ffmpeg-7.1.1-essentials_build\bin"
 os.environ["PATH"] = FFMPEG_BIN + os.pathsep + os.environ.get("PATH", "")
 
-
 GOOGLE_CRED_FILE = r"C:\Users\Aditya\Downloads\practical-argon-463304-h6-afc503b10302.json"
-CHATGROQ_KEY     = "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"
+CHATGROQ_KEY     = "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"
 GMAIL_CALENDAR   = "adityaiyer495@gmail.com"
 SCOPES           = ["https://www.googleapis.com/auth/calendar"]
 
 if not os.path.isfile(GOOGLE_CRED_FILE):
-    raise FileNotFoundError("Service‑account JSON not found")
-
+    raise FileNotFoundError("Service-account JSON not found")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 UTC = timezone.utc
 
 def parse_ist(dt_str: str) -> datetime:
-    """Parse an ISO string (with or without offset), convert to IST naive."""
     dt = datetime.fromisoformat(dt_str)
-    if dt.tzinfo is None:
-        return dt  
-    return dt.astimezone(IST).replace(tzinfo=None)
+    return dt if dt.tzinfo is None else dt.astimezone(IST).replace(tzinfo=None)
 
 def to_utc_iso(dt: datetime) -> str:
-    """Convert naive-IST dt into UTC ISO."""
-    local = dt.replace(tzinfo=IST)
-    return local.astimezone(UTC).isoformat()
-
+    return dt.replace(tzinfo=IST).astimezone(UTC).isoformat()
 
 CURRENT_YEAR = datetime.now(IST).year
 SYSTEM_PROMPT = (
-    "You are an intelligent calendar assistant. You must parse user requests to schedule meetings and use the following commands exactly when you have all details:\n"
-    "  [FIND_SLOTS start=YYYY-MM-DDTHH:MM end=YYYY-MM-DDTHH:MM duration=M]\n"
-    "  [BOOK_EVENT datetime=YYYY-MM-DDTHH:MM duration=M title=\"...\"]\n"
-    "If any detail is missing (date, time, duration, title), ask a concise follow-up question.\n"
-    "You must understand natural language dates like 'tomorrow', 'next week', 'Monday morning at 9:30am', '10:30pm', etc., and convert them into ISO datetimes in IST (Asia/Kolkata).\n"
-    f"**If the user omits the year, assume it is {CURRENT_YEAR}.**\n"
-    "If the requested slot conflicts with an existing event, suggest up to 3 alternatives.\n"
+    "You are an intelligent calendar assistant. Use exactly:\n"
+    "[FIND_SLOTS start=YYYY-MM-DDTHH:MM end=YYYY-MM-DDTHH:MM duration=M]\n"
+    "[BOOK_EVENT datetime=YYYY-MM-DDTHH:MM duration=M title=\"...\"]\n"
+    "Ask follow-ups if missing details, understand natural times in IST.\n"
+    f"If user omits year assume {CURRENT_YEAR}. Suggest 3 alternatives on conflict.\n"
     "Be clear and concise."
 )
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, groq_api_key=CHATGROQ_KEY)
-
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0,
+    groq_api_key=CHATGROQ_KEY
+)
 
 stt_model = whisper.load_model("base")
 if not shutil.which("ffmpeg"):
     logger.warning("ffmpeg not found on PATH — audio may fail")
-
 
 def get_service():
     creds = service_account.Credentials.from_service_account_file(GOOGLE_CRED_FILE, scopes=SCOPES)
@@ -101,9 +92,7 @@ def busy_blocks(svc, start: datetime, end: datetime) -> List[tuple]:
     for e in list_events(svc, start, end):
         s = e["start"].get("dateTime", e["start"].get("date"))
         t = e["end"].get("dateTime",   e["end"].get("date"))
-        si = parse_ist(s)
-        ti = parse_ist(t)
-        blocks.append((si, ti))
+        blocks.append((parse_ist(s), parse_ist(t)))
     return sorted(blocks, key=lambda x: x[0])
 
 def free_slots(svc, start: datetime, end: datetime, mins: int) -> List[str]:
@@ -114,55 +103,51 @@ def free_slots(svc, start: datetime, end: datetime, mins: int) -> List[str]:
         cur = max(cur, be)
     if (end - cur).total_seconds() >= mins*60:
         free.append((cur, end))
-    return [f"{s:%Y-%m-%d %I:%M %p} - {(s+timedelta(minutes=mins)):%I:%M %p}" for s,_ in free[:3]]
+    return [
+        f"{s:%Y-%m-%d %I:%M %p} - {(s + timedelta(minutes=mins)):%I:%M %p}"
+        for s,_ in free[:3]
+    ]
 
 def create_event(svc, start: datetime, mins: int, title: str) -> str:
     evt = {
         "summary": title,
-        "start": {"dateTime": to_utc_iso(start), "timeZone": "UTC"},
-        "end":   {"dateTime": to_utc_iso(start+timedelta(minutes=mins)), "timeZone": "UTC"}
+        "start": {"dateTime": to_utc_iso(start), "timeZone":"UTC"},
+        "end":   {"dateTime": to_utc_iso(start+timedelta(minutes=mins)), "timeZone":"UTC"}
     }
     return svc.events().insert(calendarId=GMAIL_CALENDAR, body=evt).execute().get("htmlLink")
 
-
-SESSIONS: Dict[str, Any] = {}
+SESSIONS: Dict[str,Any] = {}
 
 def process_message(session_id: str, message: str) -> str:
     ctx = SESSIONS.setdefault(session_id, {"messages":[{"role":"system","content":SYSTEM_PROMPT}]})
     ctx["messages"].append({"role":"user","content":message})
 
-    # LLM call
     conv = []
     for m in ctx["messages"]:
         conv.append({
-            "system": SystemMessage,
-            "user": HumanMessage,
+            "system":    SystemMessage,
+            "user":      HumanMessage,
             "assistant": AIMessage
         }[m["role"]](content=m["content"]))
+
     reply = llm.invoke(conv).content
     ctx["messages"].append({"role":"assistant","content":reply})
 
-    svc = get_service()
-    ensure_subscribed(svc)
+    svc = get_service(); ensure_subscribed(svc)
 
-    
-    m = re.search(r"\[FIND_SLOTS start=(\S+) end=(\S+) duration=(\d+)\]", reply)
-    if m:
+    if (m := re.search(r"\[FIND_SLOTS start=(\S+) end=(\S+) duration=(\d+)\]", reply)):
         s,e,d = m.groups()
-        start,end = parse_ist(s), parse_ist(e)
-        slots = free_slots(svc, start, end, int(d))
+        slots = free_slots(svc, parse_ist(s), parse_ist(e), int(d))
         text = "Here are available slots:\n" + "\n".join(slots)
         ctx["messages"].append({"role":"assistant","content":text})
         return text
 
-    
-    m = re.search(r"\[BOOK_EVENT datetime=(.+?) duration=(\d+) title=\"(.+?)\"\]", reply)
-    if m:
+    if (m := re.search(r"\[BOOK_EVENT datetime=(.+?) duration=(\d+) title=\"(.+?)\"\]", reply)):
         dt_str,d,title = m.groups()
         dt = parse_ist(dt_str)
         if busy_blocks(svc, dt, dt+timedelta(minutes=int(d))):
-            alt = free_slots(svc, dt.replace(hour=0,minute=0), dt.replace(hour=23,minute=59), int(d))
-            text = "Sorry, that slot is busy. Alternatives:\n" + "\n".join(alt)
+            alts = free_slots(svc, dt.replace(hour=0,minute=0), dt.replace(hour=23,minute=59), int(d))
+            text = "Sorry, that slot is busy. Alternatives:\n" + "\n".join(alts)
         else:
             link = create_event(svc, dt, int(d), title)
             text = f"Booked '{title}' on {dt:%Y-%m-%d %I:%M %p}. Link: {link}"
@@ -170,7 +155,6 @@ def process_message(session_id: str, message: str) -> str:
         return text
 
     return reply
-
 
 app = FastAPI()
 
@@ -185,17 +169,23 @@ class ResetReq(BaseModel):
 async def chat_endpoint(req: ChatReq):
     try:
         return {"reply": process_message(req.session_id, req.message)}
-    except Exception:
+    except:
         logger.error(traceback.format_exc())
         raise HTTPException(500, "Internal server error")
 
 @app.post("/audio-chat")
-async def audio_chat(session_id: str = Form(...), file: UploadFile = File(...)):
+async def audio_chat(
+    session_id: str = Form(...),
+    file: UploadFile = File(...)
+):
     if not file.content_type.startswith("audio/"):
         raise HTTPException(400, "Uploaded file must be audio/*")
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1] or ".m4a")
     try:
-        tmp.write(await file.read()); tmp.close()
+        tmp.write(await file.read())
+        tmp.close()
+
         try:
             transcript = stt_model.transcribe(tmp.name)["text"].strip()
         except:
@@ -205,11 +195,25 @@ async def audio_chat(session_id: str = Form(...), file: UploadFile = File(...)):
                 check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             txt = stt_model.transcribe(wav)["text"]
-            transcript = txt.strip() if isinstance(txt,str) else txt.decode("utf-8","ignore").strip()
+            transcript = txt.strip() if isinstance(txt, str) else txt.decode("utf-8","ignore").strip()
             os.remove(wav)
+
         logger.info("Transcript: %s", transcript)
-        return {"reply": process_message(session_id, transcript)}
-    except Exception:
+
+        reply = process_message(session_id, transcript)
+
+        buf = io.BytesIO()
+        tts = gTTS(reply, lang="en", slow=False)
+        tts.write_to_fp(buf)
+        audio_bytes = buf.getvalue()
+
+        return StreamingResponse(
+            io.BytesIO(audio_bytes),
+            media_type="audio/mpeg",
+            headers={"Content-Length": str(len(audio_bytes))}
+        )
+
+    except:
         logger.error(traceback.format_exc())
         raise HTTPException(500, "Audio transcription failed")
     finally:
@@ -218,7 +222,7 @@ async def audio_chat(session_id: str = Form(...), file: UploadFile = File(...)):
 @app.post("/reset")
 async def reset(req: ResetReq):
     SESSIONS.pop(req.session_id, None)
-    return {"status":"reset"}
+    return {"status": "reset"}
 
 if __name__ == "__main__":
     import uvicorn
